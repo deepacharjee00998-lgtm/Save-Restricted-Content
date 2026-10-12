@@ -1078,7 +1078,7 @@ if __name__ == "__main__":
     bot.add_handler(MessageHandler(clear_chat, filters.private & filters.command(["clearchat"])))
     bot.add_handler(MessageHandler(
         save,
-        filters.private & filters.text & \~filters.command([
+        filters.private & filters.text & ~filters.command([
             "start", "help", "cancel", "login", "logout", "broadcast",
             "plans", "myplan", "setchat", "settopic", "clearchat"
         ])
