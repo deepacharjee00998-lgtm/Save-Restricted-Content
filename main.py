@@ -11,15 +11,15 @@ import threading
 from datetime import timedelta
 
 import motor.motor_asyncio
-from pyrofork import Client, filters, enums
-from pyrofork.handlers import MessageHandler, CallbackQueryHandler
-from pyrofork.errors import (
+from pyrogram import Client, filters, enums
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram.errors import (
     FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant,
     InviteHashExpired, UsernameNotOccupied, PeerIdInvalid,
     ApiIdInvalid, PhoneNumberInvalid, PhoneCodeInvalid, PhoneCodeExpired,
     SessionPasswordNeeded, PasswordHashInvalid
 )
-from pyrofork.types import (
+from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 )
 from asyncio.exceptions import TimeoutError
@@ -575,7 +575,8 @@ async def save(client: Client, message: Message):
                 return await message.reply(
               "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
                 )
-        else:
+                    if ERROR_MESSAGE:
+                await client.send_else:
             if BeastXUser is None:
                 await client.send_message(message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
                 return
@@ -674,8 +675,7 @@ async def handle_private(client: Client, acc, message: Message, chatid, msgid: i
             await client.send_message(**kwargs)
             return
         except Exception as e:
-            if ERROR_MESSAGE:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
             return
 
     smsg = await client.send_message(message.chat.id, '**Downloading**', reply_to_message_id=message.id)
