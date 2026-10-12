@@ -1,6 +1,6 @@
-# BeastX Save Restricted Content Bot
-# Official: @Beastx_Bots | Support: @Beastx_Support | Dev: @Godmrunal
-# Original project credits are documented in README.md.
+# BeastX Save Restricted Content Bot + Payment System
+# Updated with Free Trial + UPI Payment + Destination Chat
+# Using pyrofork
 
 import os
 import asyncio
@@ -8,30 +8,31 @@ import datetime
 import time
 import traceback
 import threading
+from datetime import timedelta
 
 import motor.motor_asyncio
-from pyrogram import Client, filters, enums
-from pyrogram.handlers import MessageHandler
-from pyrogram.errors import (
+from pyrofork import Client, filters, enums
+from pyrofork.handlers import MessageHandler, CallbackQueryHandler
+from pyrofork.errors import (
     FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant,
-    InviteHashExpired, UsernameNotOccupied, InputUserDeactivated,
-    UserNotParticipant, UserIsBlocked, PeerIdInvalid,
+    InviteHashExpired, UsernameNotOccupied, PeerIdInvalid,
     ApiIdInvalid, PhoneNumberInvalid, PhoneCodeInvalid, PhoneCodeExpired,
     SessionPasswordNeeded, PasswordHashInvalid
 )
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrofork.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+)
 from asyncio.exceptions import TimeoutError
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # =========================
-# BeastX Configuration
+# Configuration
 # =========================
 def required_env(name):
     value = os.environ.get(name, "").strip()
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-
 
 LOGIN_SYSTEM = str(os.environ.get("LOGIN_SYSTEM", "True")).lower() in ("true", "1", "yes", "on")
 STRING_SESSION = os.environ.get("STRING_SESSION", "").strip() if not LOGIN_SYSTEM else None
@@ -44,12 +45,22 @@ DB_URI = required_env("DB_URI")
 DB_NAME = os.environ.get("DB_NAME", "beastxsavecontentbot").strip() or "beastxsavecontentbot"
 WAITING_TIME = int(os.environ.get("WAITING_TIME", "10"))
 ERROR_MESSAGE = str(os.environ.get("ERROR_MESSAGE", "True")).lower() in ("true", "1", "yes", "on")
+UPI_ID = required_env("UPI_ID")
+FREE_TRIALS = int(os.environ.get("FREE_TRIALS", "2"))
 
 if not LOGIN_SYSTEM and not STRING_SESSION:
     raise RuntimeError("STRING_SESSION is required when LOGIN_SYSTEM=False")
 
+# Plans: days -> price
+PLANS = {
+    1: 20,
+    5: 50,
+    7: 60,
+    30: 130
+}
+
 # =========================
-# BeastX Database
+# Database
 # =========================
 class Database:
     def __init__(self, uri, database_name):
@@ -58,10 +69,22 @@ class Database:
         self.col = self.db.users
 
     def new_user(self, id, name):
-        return {"id": id, "name": name, "session": None, "api_id": None, "api_hash": None}
+        return {
+            "id": id,
+            "name": name,
+            "session": None,
+            "api_id": None,
+            "api_hash": None,
+            "free_used": 0,
+            "premium_until": None,
+            "dest_chat": None,
+            "dest_topic": None,
+            "pending_plan": None
+        }
 
     async def add_user(self, id, name):
-        await self.col.insert_one(self.new_user(id, name))
+        if not await self.is_user_exist(id):
+            await self.col.insert_one(self.new_user(id, name))
 
     async def is_user_exist(self, id):
         user = await self.col.find_one({"id": int(id)})
@@ -97,10 +120,29 @@ class Database:
         user = await self.col.find_one({"id": int(id)})
         return user.get("api_hash") if user else None
 
+    async def get_user(self, id):
+        return await self.col.find_one({"id": int(id)})
+
+    async def update_user(self, id, data: dict):
+        await self.col.update_one({"id": int(id)}, {"$set": data})
+
+    async def increment_free(self, id):
+        await self.col.update_one({"id": int(id)}, {"$inc": {"free_used": 1}})
+
+    async def set_premium(self, id, days: int):
+        until = datetime.datetime.utcnow() + timedelta(days=days)
+        await self.col.update_one(
+            {"id": int(id)},
+            {"$set": {"premium_until": until, "pending_plan": None}}
+        )
+
+    async def clear_pending(self, id):
+        await self.col.update_one({"id": int(id)}, {"$set": {"pending_plan": None}})
+
 db = Database(DB_URI, DB_NAME)
 
 # =========================
-# BeastX Account Session
+# Account Session
 # =========================
 if STRING_SESSION and not LOGIN_SYSTEM:
     BeastXUser = Client("beastx", api_id=API_ID, api_hash=API_HASH, session_string=STRING_SESSION)
@@ -109,50 +151,334 @@ else:
     BeastXUser = None
 
 # =========================
-# Help Text
+# Helpers
+# =========================
+async def has_access(user_id: int):
+    """Returns (has_access, reason)"""
+    user = await db.get_user(user_id)
+    if not user:
+        return False, "User not found"
+
+    # Check premium
+    premium_until = user.get("premium_until")
+    if premium_until:
+        if isinstance(premium_until, str):
+            premium_until = datetime.datetime.fromisoformat(premium_until)
+        if premium_until > datetime.datetime.utcnow():
+            return True, "premium"
+
+    # Check free trial
+    free_used = user.get("free_used", 0)
+    if free_used < FREE_TRIALS:
+        return True, "free"
+
+    return False, "no_access"
+
+
+async def get_remaining_free(user_id: int) -> int:
+    user = await db.get_user(user_id)
+    if not user:
+        return FREE_TRIALS
+    return max(0, FREE_TRIALS - user.get("free_used", 0))
+
+
+def get_plans_keyboard():
+    buttons = []
+    for days, price in PLANS.items():
+        buttons.append([
+            InlineKeyboardButton(
+                f"{days} Day{'s' if days > 1 else ''} - ₹{price}",
+                callback_data=f"plan_{days}_{price}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_pay")])
+    return InlineKeyboardMarkup(buttons)
+
+
+# =========================
+# Start / Help
 # =========================
 HELP_TXT = """**🌟 Help Menu**
 
 **__FOR PRIVATE CHATS__**
-
-__First send the invite link of the chat (unnecessary if the account of string session is already a member), then send the post link.__
+First send the invite link of the chat, then send the post link.
 
 **__FOR BOT CHATS__**
-
-__Send a link with '/b/', bot username and message id.__
-
-```text
-https://t.me/b/botusername/4321
-```
+Send link like:
+`https://t.me/b/botusername/4321`
 
 **__MULTI POSTS__**
+`https://t.me/xxxx/1001-1010`
+`https://t.me/c/xxxx/101-120`
 
-__Send public/private post links using "from - to" to send multiple messages.__
+**__Payment Commands__**
+/plans - See available plans
+/myplan - Check your current plan
+/setchat <chat_id> - Set destination chat
+/settopic <topic_id> - Set topic (for forum groups)
+/clearchat - Clear destination
 
-```text
-https://t.me/xxxx/1001-1010
-https://t.me/c/xxxx/101 - 120
-```
+**__Other__**
+/login - Login your account
+/logout - Logout
+/cancel - Cancel batch
+"""
 
-__Spaces in between do not matter.__"""
+@Client.on_message(filters.command(["start"]))
+async def send_start(client: Client, message: Message):
+    if not await db.is_user_exist(message.from_user.id):
+        await db.add_user(message.from_user.id, message.from_user.first_name)
 
-import os
-import asyncio 
-import pyrogram
-from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message 
+    remaining = await get_remaining_free(message.from_user.id)
+    access, reason = await has_access(message.from_user.id)
 
+    status = ""
+    if reason == "premium":
+        user = await db.get_user(message.from_user.id)
+        until = user.get("premium_until")
+        status = f"\n\n✅ **Premium Active** till `{until}`"
+    elif reason == "free":
+        status = f"\n\n🎁 **Free Trial Remaining:** `{remaining}`"
+
+    buttons = [[
+        InlineKeyboardButton("💳 Buy Premium", callback_data="show_plans")
+    ], [
+        InlineKeyboardButton("❣️ Developer", url="https://t.me/Godmrunal")
+    ], [
+        InlineKeyboardButton('🔍 Support', url='https://t.me/Beastx_Support'),
+        InlineKeyboardButton('🤖 Updates', url='https://t.me/Beastx_Bots')
+    ]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    await client.send_message(
+        chat_id=message.chat.id,
+        text=f"<b>👋 Hi {message.from_user.mention}, I am Save Restricted Content Bot.\n\nI can send you restricted content by its post link.\n\nFor downloading restricted content /login first.\n\nKnow how to use → /help</b>{status}",
+        reply_markup=reply_markup,
+        reply_to_message_id=message.id
+    )
+
+
+@Client.on_message(filters.command(["help"]))
+async def send_help(client: Client, message: Message):
+    await client.send_message(chat_id=message.chat.id, text=HELP_TXT)
+
+
+@Client.on_message(filters.command(["cancel"]))
+async def send_cancel(client: Client, message: Message):
+    batch_temp.IS_BATCH[message.from_user.id] = True
+    await client.send_message(chat_id=message.chat.id, text="**Batch Successfully Cancelled.**")
+
+
+# =========================
+# Payment Commands
+# =========================
+@Client.on_message(filters.command(["plans"]))
+async def show_plans_cmd(client: Client, message: Message):
+    text = "**💳 Available Plans**\n\n"
+    for days, price in PLANS.items():
+        text += f"• {days} Day{'s' if days > 1 else ''} → ₹{price}\n"
+    text += "\nSelect a plan below:"
+    await message.reply(text, reply_markup=get_plans_keyboard())
+
+
+@Client.on_message(filters.command(["myplan"]))
+async def my_plan(client: Client, message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        await message.reply("You are not registered. Send /start")
+        return
+
+    free_used = user.get("free_used", 0)
+    remaining = max(0, FREE_TRIALS - free_used)
+    premium_until = user.get("premium_until")
+
+    text = f"**📊 Your Plan Status**\n\n"
+    text += f"🎁 Free Trial Used: `{free_used}/{FREE_TRIALS}`\n"
+    text += f"🎁 Remaining Free: `{remaining}`\n\n"
+
+    if premium_until:
+        if isinstance(premium_until, str):
+            premium_until = datetime.datetime.fromisoformat(premium_until)
+        if premium_until > datetime.datetime.utcnow():
+            text += f"✅ **Premium Active**\nExpires: `{premium_until.strftime('%Y-%m-%d %H:%M')} UTC`"
+        else:
+            text += "❌ Premium Expired"
+    else:
+        text += "❌ No active Premium"
+
+    await message.reply(text)
+
+
+@Client.on_message(filters.command(["setchat"]))
+async def set_chat(client: Client, message: Message):
+    try:
+        chat_id = int(message.command[1])
+        await db.update_user(message.from_user.id, {"dest_chat": chat_id})
+        await message.reply(f"**Destination Chat set to:** `{chat_id}`\n\nNow all downloads will go there.")
+    except:
+        await message.reply("**Usage:** `/setchat -100xxxxxxxxxx`")
+
+
+@Client.on_message(filters.command(["settopic"]))
+async def set_topic(client: Client, message: Message):
+    try:
+        topic_id = int(message.command[1])
+        await db.update_user(message.from_user.id, {"dest_topic": topic_id})
+        await message.reply(f"**Topic ID set to:** `{topic_id}`")
+    except:
+        await message.reply("**Usage:** `/settopic 123`")
+
+
+@Client.on_message(filters.command(["clearchat"]))
+async def clear_chat(client: Client, message: Message):
+    await db.update_user(message.from_user.id, {"dest_chat": None, "dest_topic": None})
+    await message.reply("**Destination cleared.** Downloads will come to your private chat.")
+
+
+# =========================
+# Callback Handlers
+# =========================
+@Client.on_callback_query(filters.regex(r"^show_plans$"))
+async def cb_show_plans(client: Client, query: CallbackQuery):
+    await query.message.edit_text(
+        "**💳 Select a Plan:**",
+        reply_markup=get_plans_keyboard()
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^plan_(\d+)_(\d+)$"))
+async def cb_select_plan(client: Client, query: CallbackQuery):
+    days = int(query.matches[0].group(1))
+    price = int(query.matches[0].group(2))
+
+    await db.update_user(query.from_user.id, {
+        "pending_plan": {"days": days, "price": price}
+    })
+
+    text = (
+        f"**✅ Plan Selected**\n\n"
+        f"📅 Duration: **{days} Day{'s' if days > 1 else ''}**\n"
+        f"💰 Amount: **₹{price}**\n\n"
+        f"**UPI ID:** `{UPI_ID}`\n\n"
+        f"1️⃣ Is UPI ID pe ₹{price} pay karo\n"
+        f"2️⃣ Payment ke baad neeche **Maine Payment Kar Diya** button dabao\n"
+        f"3️⃣ Admin approve karega → Premium start ho jayega"
+    )
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Maine Payment Kar Diya", callback_data=f"paid_{days}_{price}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="show_plans")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_pay")]
+    ])
+    await query.message.edit_text(text, reply_markup=buttons)
+
+
+@Client.on_callback_query(filters.regex(r"^paid_(\d+)_(\d+)$"))
+async def cb_paid(client: Client, query: CallbackQuery):
+    days = int(query.matches[0].group(1))
+    price = int(query.matches[0].group(2))
+    user_id = query.from_user.id
+    name = query.from_user.first_name
+    username = query.from_user.username or "NoUsername"
+
+    # Notify Admin
+    admin_text = (
+        f"**💰 New Payment Request**\n\n"
+        f"👤 User: [{name}](tg://user?id={user_id})\n"
+        f"🆔 ID: `{user_id}`\n"
+        f"🔗 Username: @{username}\n"
+        f"📅 Plan: **{days} Days**\n"
+        f"💰 Amount: **₹{price}**\n\n"
+        f"Approve karein?"
+    )
+    admin_buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}_{days}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}")
+        ]
+    ])
+    try:
+        await client.send_message(ADMINS, admin_text, reply_markup=admin_buttons)
+    except Exception as e:
+        await query.message.edit_text(f"Error sending to admin: {e}")
+        return
+
+    await query.message.edit_text(
+        "**✅ Payment request Admin ko bhej diya gaya hai.**\n\n"
+        "Admin approve karega to aapka Premium plan activate ho jayega.\n"
+        "Thoda wait karein."
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^approve_(\d+)_(\d+)$"))
+async def cb_approve(client: Client, query: CallbackQuery):
+    if query.from_user.id != ADMINS:
+        await query.answer("Only Admin can approve!", show_alert=True)
+        return
+
+    user_id = int(query.matches[0].group(1))
+    days = int(query.matches[0].group(2))
+
+    await db.set_premium(user_id, days)
+
+    try:
+        await client.send_message(
+            user_id,
+            f"**🎉 Payment Approved!**\n\n"
+            f"Aapka **{days} Days Premium** plan activate ho gaya hai.\n"
+            f"Ab aap restricted content download kar sakte ho.\n\n"
+            f"Check status: /myplan"
+        )
+    except:
+        pass
+
+    await query.message.edit_text(
+        f"**✅ Approved**\nUser `{user_id}` ko {days} days premium de diya gaya."
+    )
+    await query.answer("Approved!")
+
+
+@Client.on_callback_query(filters.regex(r"^reject_(\d+)$"))
+async def cb_reject(client: Client, query: CallbackQuery):
+    if query.from_user.id != ADMINS:
+        await query.answer("Only Admin can reject!", show_alert=True)
+        return
+
+    user_id = int(query.matches[0].group(1))
+    await db.clear_pending(user_id)
+
+    try:
+        await client.send_message(
+            user_id,
+            "**❌ Payment Rejected**\n\n"
+            "Aapka payment request reject kar diya gaya.\n"
+            "Agar aapne payment kiya hai to Admin se contact karein."
+        )
+    except:
+        pass
+
+    await query.message.edit_text(f"**❌ Rejected** User `{user_id}`")
+    await query.answer("Rejected!")
+
+
+@Client.on_callback_query(filters.regex(r"^cancel_pay$"))
+async def cb_cancel_pay(client: Client, query: CallbackQuery):
+    await db.clear_pending(query.from_user.id)
+    await query.message.edit_text("**Payment cancelled.**")
+
+
+# =========================
+# Batch Temp
+# =========================
 class batch_temp(object):
     IS_BATCH = {}
+
 
 async def downstatus(client, statusfile, message, chat):
     while True:
         if os.path.exists(statusfile):
             break
-
         await asyncio.sleep(3)
-      
     while os.path.exists(statusfile):
         with open(statusfile, "r") as downread:
             txt = downread.read()
@@ -163,13 +489,11 @@ async def downstatus(client, statusfile, message, chat):
             await asyncio.sleep(5)
 
 
-# upload status
 async def upstatus(client, statusfile, message, chat):
     while True:
         if os.path.exists(statusfile):
             break
-
-        await asyncio.sleep(3)      
+        await asyncio.sleep(3)
     while os.path.exists(statusfile):
         with open(statusfile, "r") as upread:
             txt = upread.read()
@@ -180,61 +504,39 @@ async def upstatus(client, statusfile, message, chat):
             await asyncio.sleep(5)
 
 
-# progress writer
 def progress(current, total, message, type):
     with open(f'{message.id}{type}status.txt', "w") as fileup:
         fileup.write(f"{current * 100 / total:.1f}%")
 
 
-# start command
-@Client.on_message(filters.command(["start"]))
-async def send_start(client: Client, message: Message):
-    if not await db.is_user_exist(message.from_user.id):
-        await db.add_user(message.from_user.id, message.from_user.first_name)
-    buttons = [[
-        InlineKeyboardButton("❣️ Developer", url = "https://t.me/Godmrunal")
-    ],[
-        InlineKeyboardButton('🔍 sᴜᴘᴘᴏʀᴛ ɢʀᴏᴜᴘ', url='https://t.me/Beastx_Support'),
-        InlineKeyboardButton('🤖 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Beastx_Bots')
-    ]]
-    reply_markup = InlineKeyboardMarkup(buttons)
-    await client.send_message(
-        chat_id=message.chat.id, 
-        text=f"<b>👋 Hi {message.from_user.mention}, I am Save Restricted Content Bot, I can send you restricted content by its post link.\n\nFor downloading restricted content /login first.\n\nKnow how to use bot by - /help</b>", 
-        reply_markup=reply_markup, 
-        reply_to_message_id=message.id
-    )
-    return
-
-
-# help command
-@Client.on_message(filters.command(["help"]))
-async def send_help(client: Client, message: Message):
-    await client.send_message(
-        chat_id=message.chat.id, 
-        text=f"{HELP_TXT}"
-    )
-
-# cancel command
-@Client.on_message(filters.command(["cancel"]))
-async def send_cancel(client: Client, message: Message):
-    batch_temp.IS_BATCH[message.from_user.id] = True
-    await client.send_message(
-        chat_id=message.chat.id, 
-        text="**Batch Successfully Cancelled.**"
-    )
-
-@Client.on_message(filters.text & filters.private & ~filters.command(["start", "help", "cancel", "login", "logout"]))
+# =========================
+# Main Save Handler (with access check)
+# =========================
+@Client.on_message(filters.text & filters.private & \~filters.command([
+    "start", "help", "cancel", "login", "logout", "broadcast",
+    "plans", "myplan", "setchat", "settopic", "clearchat"
+]))
 async def save(client: Client, message: Message):
+    # Access Check
+    access, reason = await has_access(message.from_user.id)
+    if not access:
+        await message.reply(
+            "**❌ Free Trial Khatam Ho Gaya!**\n\n"
+            "Premium plan kharido to continue kar sako.\n"
+            "Neeche se plan select karo:",
+            reply_markup=get_plans_keyboard()
+        )
+        return
+
     # Joining chat
-    if ("https://t.me/+" in message.text or "https://t.me/joinchat/" in message.text) and LOGIN_SYSTEM == False:
+    if ("https://t.me/+" in message.text or "https://t.me/joinchat/" in message.text) and not LOGIN_SYSTEM:
         if BeastXUser is None:
             await client.send_message(message.chat.id, "String Session is not Set", reply_to_message_id=message.id)
             return
         try:
             try:
                 await BeastXUser.join_chat(message.text)
-            except Exception as e: 
+            except Exception as e:
                 await client.send_message(message.chat.id, f"Error : {e}", reply_to_message_id=message.id)
                 return
             await client.send_message(message.chat.id, "Chat Joined", reply_to_message_id=message.id)
@@ -243,19 +545,22 @@ async def save(client: Client, message: Message):
         except InviteHashExpired:
             await client.send_message(message.chat.id, "Invalid Link", reply_to_message_id=message.id)
         return
-    
+
     if "https://t.me/" in message.text:
         if batch_temp.IS_BATCH.get(message.from_user.id) == False:
-            return await message.reply_text("**One Task Is Already Processing. Wait For Complete It. If You Want To Cancel This Task Then Use - /cancel**")
+            return await message.reply_text(
+                "**One Task Is Already Processing. Wait For Complete It. If You Want To Cancel This Task Then Use - /cancel**"
+            )
+
         datas = message.text.split("/")
-        temp = datas[-1].replace("?single","").split("-")
+        temp = datas[-1].replace("?single", "").split("-")
         fromID = int(temp[0].strip())
         try:
             toID = int(temp[1].strip())
         except:
             toID = fromID
 
-        if LOGIN_SYSTEM == True:
+        if LOGIN_SYSTEM:
             user_data = await db.get_session(message.from_user.id)
             if user_data is None:
                 await message.reply("**For Downloading Restricted Content You Have To /login First.**")
@@ -266,250 +571,272 @@ async def save(client: Client, message: Message):
                 acc = Client("saverestricted", session_string=user_data, api_hash=api_hash, api_id=api_id)
                 await acc.connect()
             except:
-                return await message.reply("**Your Login Session Expired. So /logout First Then Login Again By - /login**")
+                return await message.reply(
+              "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
+                )
         else:
             if BeastXUser is None:
-                await client.send_message(message.chat.id, f"**String Session is not Set**", reply_to_message_id=message.id)
+                await client.send_message(message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
                 return
             acc = BeastXUser
-				
+
         batch_temp.IS_BATCH[message.from_user.id] = False
-        for msgid in range(fromID, toID+1):
-            if batch_temp.IS_BATCH.get(message.from_user.id): break
-            
-            # private
+
+        # Get destination
+        user = await db.get_user(message.from_user.id)
+        dest_chat = user.get("dest_chat") if user else None
+        dest_topic = user.get("dest_topic") if user else None
+        if not dest_chat:
+            dest_chat = message.chat.id
+
+        for msgid in range(fromID, toID + 1):
+            if batch_temp.IS_BATCH.get(message.from_user.id):
+                break
+
             if "https://t.me/c/" in message.text:
                 chatid = int("-100" + datas[4])
                 try:
-                    await handle_private(client, acc, message, chatid, msgid)
+                    await handle_private(client, acc, message, chatid, msgid, dest_chat, dest_topic)
                 except Exception as e:
-                    if ERROR_MESSAGE == True:
+                    if ERROR_MESSAGE:
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-    
-            # bot
+
             elif "https://t.me/b/" in message.text:
                 username = datas[4]
                 try:
-                    await handle_private(client, acc, message, username, msgid)
+                    await handle_private(client, acc, message, username, msgid, dest_chat, dest_topic)
                 except Exception as e:
-                    if ERROR_MESSAGE == True:
+                    if ERROR_MESSAGE:
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            
-            # public
+
             else:
                 username = datas[3]
-
                 try:
                     msg = await client.get_messages(username, msgid)
-                except UsernameNotOccupied: 
+                except UsernameNotOccupied:
                     await client.send_message(message.chat.id, "The username is not occupied by anyone", reply_to_message_id=message.id)
                     return
                 try:
-                    await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                    kwargs = {"reply_to_message_id": message.id}
+                    if dest_topic:
+                        kwargs["message_thread_id"] = dest_topic
+                    await client.copy_message(dest_chat, msg.chat.id, msg.id, **kwargs)
                 except:
-                    try:    
-                        await handle_private(client, acc, message, username, msgid)               
+                    try:
+                        await handle_private(client, acc, message, username, msgid, dest_chat, dest_topic)
                     except Exception as e:
-                        if ERROR_MESSAGE == True:
+                        if ERROR_MESSAGE:
                             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
-            # wait time
             await asyncio.sleep(WAITING_TIME)
-        if LOGIN_SYSTEM == True:
+
+        # Consume free trial if used
+        if reason == "free":
+            await db.increment_free(message.from_user.id)
+
+        if LOGIN_SYSTEM:
             try:
                 await acc.disconnect()
             except:
-                pass                				
+                pass
         batch_temp.IS_BATCH[message.from_user.id] = True
 
 
-# handle private
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+# =========================
+# Handle Private
+# =========================
+async def handle_private(client: Client, acc, message: Message, chatid, msgid: int, dest_chat=None, dest_topic=None):
     msg: Message = await acc.get_messages(chatid, msgid)
-    if msg.empty: return 
+    if msg.empty:
+        return
     msg_type = get_message_type(msg)
-    if not msg_type: return 
-    if CHANNEL_ID:
-        try:
-            chat = int(CHANNEL_ID)
-        except:
-            chat = message.chat.id
-    else:
-        chat = message.chat.id
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
+    if not msg_type:
+        return
+
+    if not dest_chat:
+        dest_chat = message.chat.id
+
+    if batch_temp.IS_BATCH.get(message.from_user.id):
+        return
+
     if "Text" == msg_type:
         try:
-            await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-            return 
+            kwargs = {
+                "chat_id": dest_chat,
+                "text": msg.text,
+                "entities": msg.entities,
+                "reply_to_message_id": message.id if dest_chat == message.chat.id else None,
+                "parse_mode": enums.ParseMode.HTML
+            }
+            if dest_topic:
+                kwargs["message_thread_id"] = dest_topic
+            await client.send_message(**kwargs)
+            return
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-            return 
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+            return
 
     smsg = await client.send_message(message.chat.id, '**Downloading**', reply_to_message_id=message.id)
-    asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
+    asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, message.chat.id))
     try:
-        file = await acc.download_media(msg, progress=progress, progress_args=[message,"down"])
+        file = await acc.download_media(msg, progress=progress, progress_args=[message, "down"])
         os.remove(f'{message.id}downstatus.txt')
     except Exception as e:
-        if ERROR_MESSAGE == True:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML) 
+        if ERROR_MESSAGE:
+            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
         return await smsg.delete()
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
-    asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
 
-    if msg.caption:
-        caption = msg.caption
-    else:
-        caption = None
-    if batch_temp.IS_BATCH.get(message.from_user.id): return 
-            
+    if batch_temp.IS_BATCH.get(message.from_user.id):
+        return
+
+    asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, message.chat.id))
+
+    caption = msg.caption if msg.caption else None
+
+    send_kwargs = {
+        "chat_id": dest_chat,
+        "reply_to_message_id": message.id if dest_chat == message.chat.id else None,
+        "parse_mode": enums.ParseMode.HTML,
+        "progress": progress,
+        "progress_args": [message, "up"]
+    }
+    if dest_topic:
+        send_kwargs["message_thread_id"] = dest_topic
+
     if "Document" == msg_type:
         try:
             ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
         except:
             ph_path = None
-        
         try:
-            await client.send_document(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
+            await client.send_document(document=file, thumb=ph_path, caption=caption, **send_kwargs)
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
-        
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        if ph_path:
+            os.remove(ph_path)
 
     elif "Video" == msg_type:
         try:
             ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
         except:
             ph_path = None
-        
         try:
-            await client.send_video(chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
+            await client.send_video(
+                video=file,
+                duration=msg.video.duration,
+                width=msg.video.width,
+                height=msg.video.height,
+                thumb=ph_path,
+                caption=caption,
+                **send_kwargs
+            )
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        if ph_path != None: os.remove(ph_path)
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        if ph_path:
+            os.remove(ph_path)
 
     elif "Animation" == msg_type:
         try:
-            await client.send_animation(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            await client.send_animation(animation=file, **send_kwargs)
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
     elif "Sticker" == msg_type:
         try:
-            await client.send_sticker(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            await client.send_sticker(sticker=file, **send_kwargs)
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)     
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
     elif "Voice" == msg_type:
         try:
-            await client.send_voice(chat, file, caption=caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])
+            await client.send_voice(voice=file, caption=caption, **send_kwargs)
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
     elif "Audio" == msg_type:
         try:
             ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
         except:
             ph_path = None
-
         try:
-            await client.send_audio(chat, file, thumb=ph_path, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML, progress=progress, progress_args=[message,"up"])   
+            await client.send_audio(audio=file, thumb=ph_path, caption=caption, **send_kwargs)
         except Exception as e:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        
-        if ph_path != None: os.remove(ph_path)
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        if ph_path:
+            os.remove(ph_path)
 
     elif "Photo" == msg_type:
         try:
-            await client.send_photo(chat, file, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-        except:
-            if ERROR_MESSAGE == True:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
-    
-    if os.path.exists(f'{message.id}upstatus.txt'): 
+            await client.send_photo(photo=file, caption=caption, **send_kwargs)
+        except Exception as e:
+            if ERROR_MESSAGE:
+                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+    if os.path.exists(f'{message.id}upstatus.txt'):
         os.remove(f'{message.id}upstatus.txt')
-        os.remove(file)
-    await client.delete_messages(message.chat.id,[smsg.id])
+        if os.path.exists(file):
+            os.remove(file)
+    await client.delete_messages(message.chat.id, [smsg.id])
 
 
-# get the type of message
-def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
+def get_message_type(msg):
     try:
         msg.document.file_id
         return "Document"
     except:
         pass
-
     try:
         msg.video.file_id
         return "Video"
     except:
         pass
-
     try:
         msg.animation.file_id
         return "Animation"
     except:
         pass
-
     try:
         msg.sticker.file_id
         return "Sticker"
     except:
         pass
-
     try:
         msg.voice.file_id
         return "Voice"
     except:
         pass
-
     try:
         msg.audio.file_id
         return "Audio"
     except:
         pass
-
     try:
         msg.photo.file_id
         return "Photo"
     except:
         pass
-
     try:
         msg.text
         return "Text"
     except:
         pass
 
-import traceback
-from pyrogram.types import Message
-from pyrogram import Client, filters
-from asyncio.exceptions import TimeoutError
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import (
-    ApiIdInvalid,
-    PhoneNumberInvalid,
-    PhoneCodeInvalid,
-    PhoneCodeExpired,
-    SessionPasswordNeeded,
-    PasswordHashInvalid
-)
 
+# =========================
+# Login / Logout
+# =========================
 SESSION_STRING_SIZE = 351
-
-# Input filters used by the interactive login flow.
-# Do not let slash commands such as /start or /help get consumed by bot.ask().
-PLAIN_TEXT = filters.text & ~filters.regex(r"^/")
+PLAIN_TEXT = filters.text & \~filters.regex(r"^/")
 LOGIN_INPUT = PLAIN_TEXT | filters.command(["cancel"])
 API_ID_INPUT = PLAIN_TEXT | filters.command(["skip", "cancel"])
+
 
 async def logout(client, message):
     user_data = await db.get_session(message.from_user.id)
@@ -521,14 +848,19 @@ async def logout(client, message):
     await db.set_api_hash(message.from_user.id, api_hash=None)
     await message.reply("**Logout Successfully** ♦")
 
+
 async def login_command(bot: Client, message: Message):
     user_data = await db.get_session(message.from_user.id)
     if user_data is not None:
-        await message.reply("**Your Are Already Logged In. First /logout Your Old Session. Then Do Login.**")
-        return 
+        await message.reply("**You Are Already Logged In. First /logout Your Old Session. Then Do Login.**")
+        return
     user_id = int(message.from_user.id)
-    #await message.reply("**How To Create Api Id And Api Hash.**")
-    api_id_msg = await bot.ask(user_id, "<b>Send Your API ID.\n\nClick On /skip To Skip This Process\n\nNOTE :- If You Skip This Then Your Account Ban Chance Is High.</b>", filters=API_ID_INPUT)
+
+    api_id_msg = await bot.ask(
+        user_id,
+        "<b>Send Your API ID.\n\nClick On /skip To Skip This Process\n\nNOTE :- If You Skip This Then Your Account Ban Chance Is High.</b>",
+        filters=API_ID_INPUT
+    )
     if api_id_msg.text == "/cancel":
         return await api_id_msg.reply("<b>Process cancelled.</b>")
     if api_id_msg.text == "/skip":
@@ -538,15 +870,23 @@ async def login_command(bot: Client, message: Message):
         try:
             api_id = int(api_id_msg.text)
         except ValueError:
-            await api_id_msg.reply("**Api id must be an integer, start your process again by /login**", quote=True, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 /login", url="https://t.me/" + (await bot.get_me()).username)]]))
+            await api_id_msg.reply(
+                "**Api id must be an integer, start your process again by /login**",
+                quote=True,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 /login", url="https://t.me/" + (await bot.get_me()).username)]])
+            )
             return
         api_hash_msg = await bot.ask(user_id, "**Now Send Me Your API HASH**", filters=LOGIN_INPUT)
         if api_hash_msg.text == "/cancel":
             return await api_hash_msg.reply("<b>Process cancelled.</b>")
         api_hash = api_hash_msg.text
-        
-    phone_number_msg = await bot.ask(chat_id=user_id, text="<b>Please send your phone number which includes country code</b>\n<b>Example:</b> <code>+13124562345, +9171828181889</code>", filters=LOGIN_INPUT)
-    if phone_number_msg.text=='/cancel':
+
+    phone_number_msg = await bot.ask(
+        chat_id=user_id,
+        text="<b>Please send your phone number which includes country code</b>\n<b>Example:</b> <code>+13124562345, +9171828181889</code>",
+        filters=LOGIN_INPUT
+    )
+    if phone_number_msg.text == '/cancel':
         return await phone_number_msg.reply('<b>process cancelled !</b>')
     phone_number = phone_number_msg.text
     client = Client("beastx_login", api_id=api_id, api_hash=api_hash, in_memory=True)
@@ -554,11 +894,16 @@ async def login_command(bot: Client, message: Message):
     await phone_number_msg.reply("Sending OTP...")
     try:
         code = await client.send_code(phone_number)
-        phone_code_msg = await bot.ask(user_id, "Please check for an OTP in official telegram account. If you got it, send OTP here after reading the below format. \n\nIf OTP is `12345`, **please send it as** `1 2 3 4 5`.\n\n**Enter /cancel to cancel The Procces**", filters=LOGIN_INPUT, timeout=600)
+        phone_code_msg = await bot.ask(
+            user_id,
+            "Please check for an OTP in official telegram account. If you got it, send OTP here after reading the below format. \n\nIf OTP is `12345`, **please send it as** `1 2 3 4 5`.\n\n**Enter /cancel to cancel The Procces**",
+            filters=LOGIN_INPUT,
+            timeout=600
+        )
     except PhoneNumberInvalid:
         await phone_number_msg.reply('`PHONE_NUMBER` **is invalid.**')
         return
-    if phone_code_msg.text=='/cancel':
+    if phone_code_msg.text == '/cancel':
         return await phone_code_msg.reply('<b>process cancelled !</b>')
     try:
         phone_code = phone_code_msg.text.replace(" ", "")
@@ -570,8 +915,13 @@ async def login_command(bot: Client, message: Message):
         await phone_code_msg.reply('**OTP is expired.**')
         return
     except SessionPasswordNeeded:
-        two_step_msg = await bot.ask(user_id, '**Your account has enabled two-step verification. Please provide the password.\n\nEnter /cancel to cancel The Procces**', filters=LOGIN_INPUT, timeout=300)
-        if two_step_msg.text=='/cancel':
+        two_step_msg = await bot.ask(
+            user_id,
+            '**Your account has enabled two-step verification. Please provide the password.\n\nEnter /cancel to cancel The Procces**',
+            filters=LOGIN_INPUT,
+            timeout=300
+        )
+        if two_step_msg.text == '/cancel':
             return await two_step_msg.reply('<b>process cancelled !</b>')
         try:
             password = two_step_msg.text
@@ -582,29 +932,28 @@ async def login_command(bot: Client, message: Message):
     string_session = await client.export_session_string()
     await client.disconnect()
     if len(string_session) < SESSION_STRING_SIZE:
-        return await message.reply('<b>invalid session sring</b>')
+        return await message.reply('<b>invalid session string</b>')
     try:
-        user_data = await db.get_session(message.from_user.id)
-        if user_data is None:
-            uclient = Client("beastx_verify", session_string=string_session, api_id=api_id, api_hash=api_hash, in_memory=True)
-            await uclient.connect()
-            await db.set_session(message.from_user.id, session=string_session)
-            await db.set_api_id(message.from_user.id, api_id=api_id)
-            await db.set_api_hash(message.from_user.id, api_hash=api_hash)
-            try:
-                await uclient.disconnect()
-            except:
-                pass
+        uclient = Client("beastx_verify", session_string=string_session, api_id=api_id, api_hash=api_hash, in_memory=True)
+        await uclient.connect()
+        await db.set_session(message.from_user.id, session=string_session)
+        await db.set_api_id(message.from_user.id, api_id=api_id)
+        await db.set_api_hash(message.from_user.id, api_hash=api_hash)
+        try:
+            await uclient.disconnect()
+        except:
+            pass
     except Exception as e:
         return await message.reply_text(f"<b>ERROR IN LOGIN:</b> `{e}`")
-    await bot.send_message(message.from_user.id, "<b>Account Login Successfully.\n\nIf You Get Any Error Related To AUTH KEY Then /logout first and /login again</b>")
+    await bot.send_message(
+        message.from_user.id,
+        "<b>Account Login Successfully.\n\nIf You Get Any Error Related To AUTH KEY Then /logout first and /login again</b>"
+    )
 
-from pyrogram.errors import InputUserDeactivated, UserNotParticipant, FloodWait, UserIsBlocked, PeerIdInvalid
-from pyrogram import Client, filters
-import asyncio
-import datetime
-import time
 
+# =========================
+# Broadcast
+# =========================
 async def broadcast_messages(user_id, message):
     try:
         await message.copy(chat_id=user_id)
@@ -621,7 +970,7 @@ async def broadcast_messages(user_id, message):
     except PeerIdInvalid:
         await db.delete_user(int(user_id))
         return False, "Error"
-    except Exception as e:
+    except Exception:
         return False, "Error"
 
 
@@ -631,16 +980,13 @@ async def broadcast(bot, message):
     b_msg = message.reply_to_message
     if not b_msg:
         return await message.reply_text("**Reply This Command To Your Broadcast Message**")
-    sts = await message.reply_text(
-        text='Broadcasting your messages...'
-    )
+    sts = await message.reply_text(text='Broadcasting your messages...')
     start_time = time.time()
     total_users = await db.total_users_count()
     done = 0
     blocked = 0
     deleted = 0
-    failed =0
-
+    failed = 0
     success = 0
     async for user in users:
         if 'id' in user:
@@ -656,48 +1002,20 @@ async def broadcast(bot, message):
                     failed += 1
             done += 1
             if not done % 20:
-                await sts.edit(f"Broadcast in progress:\n\nTotal Users {total_users}\nCompleted: {done} / {total_users}\nSuccess: {success}\nBlocked: {blocked}\nDeleted: {deleted}")    
+                await sts.edit(
+                    f"Broadcast in progress:\n\nTotal Users {total_users}\nCompleted: {done} / {total_users}\nSuccess: {success}\nBlocked: {blocked}\nDeleted: {deleted}"
+                )
         else:
-            # Handle the case where 'id' key is missing in the user dictionary
             done += 1
             failed += 1
-            if not done % 20:
-                await sts.edit(f"Broadcast in progress:\n\nTotal Users {total_users}\nCompleted: {done} / {total_users}\nSuccess: {success}\nBlocked: {blocked}\nDeleted: {deleted}")    
-    
-    time_taken = datetime.timedelta(seconds=int(time.time()-start_time))
-    await sts.edit(f"Broadcast Completed:\nCompleted in {time_taken} seconds.\n\nTotal Users {total_users}\nCompleted: {done} / {total_users}\nSuccess: {success}\nBlocked: {blocked}\nDeleted: {deleted}")
+    time_taken = datetime.timedelta(seconds=int(time.time() - start_time))
+    await sts.edit(
+        f"Broadcast Completed:\nCompleted in {time_taken} seconds.\n\nTotal Users {total_users}\nCompleted: {done} / {total_users}\nSuccess: {success}\nBlocked: {blocked}\nDeleted: {deleted}"
+    )
 
-HELP_TXT = """**🌟 Help Menu** 
-
-**__FOR PRIVATE CHATS__**
-
-__first send invite link of the chat (unnecessary if the account of string session already member of the chat)
-then send post/s link__
-
-
-**__FOR BOT CHATS__**
-
-__send link with '/b/', bot's username and message id, you might want to install some unofficial client (like - Plus Messenger) to get the id like below__
-
-```
-https://t.me/b/botusername/4321
-```
-
-**__MULTI POSTS__**
-
-__send public/private posts link as explained above with formate "from - to" to send multiple messages like below__
-
-
-```
-https://t.me/xxxx/1001-1010
-
-https://t.me/c/xxxx/101 - 120
-```
-
-__note that space in between doesn't matter__"""
 
 # =========================
-# BeastX Bot
+# Bot Class
 # =========================
 class Bot(Client):
     def __init__(self):
@@ -713,7 +1031,7 @@ class Bot(Client):
 
     async def start(self, *args, **kwargs):
         await super().start(*args, **kwargs)
-        print("BeastX Bot Started | @Beastx_Bots | Dev @Godmrunal")
+        print("BeastX Bot + Payment System Started")
 
     async def stop(self, *args):
         await super().stop()
@@ -731,52 +1049,46 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, *args):
-        pass  # silence noisy access logs
+        pass
 
 
 def _start_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print("Health check server listening on port %s", HEALTH_PORT)
-
-
-
+    print(f"Health check server listening on port {HEALTH_PORT}")
 
 
 if __name__ == "__main__":
     bot = Bot()
     _start_health_server()
-    # Register every command explicitly on the actual Bot instance.
-    # The project was consolidated into one file, so decorators attached to
-    # the base Client are not relied upon here.
-    bot.add_handler(MessageHandler(
-        send_start,
-        filters.private & filters.command(["start"])
-    ))
-    bot.add_handler(MessageHandler(
-        send_help,
-        filters.private & filters.command(["help"])
-    ))
-    bot.add_handler(MessageHandler(
-        send_cancel,
-        filters.private & filters.command(["cancel"])
-    ))
-    bot.add_handler(MessageHandler(
-        logout,
-        filters.private & filters.command(["logout"])
-    ))
-    bot.add_handler(MessageHandler(
-        login_command,
-        filters.private & filters.command(["login"])
-    ))
+
+    # Register handlers
+    bot.add_handler(MessageHandler(send_start, filters.private & filters.command(["start"])))
+    bot.add_handler(MessageHandler(send_help, filters.private & filters.command(["help"])))
+    bot.add_handler(MessageHandler(send_cancel, filters.private & filters.command(["cancel"])))
+    bot.add_handler(MessageHandler(logout, filters.private & filters.command(["logout"])))
+    bot.add_handler(MessageHandler(login_command, filters.private & filters.command(["login"])))
+    bot.add_handler(MessageHandler(show_plans_cmd, filters.private & filters.command(["plans"])))
+    bot.add_handler(MessageHandler(my_plan, filters.private & filters.command(["myplan"])))
+    bot.add_handler(MessageHandler(set_chat, filters.private & filters.command(["setchat"])))
+    bot.add_handler(MessageHandler(set_topic, filters.private & filters.command(["settopic"])))
+    bot.add_handler(MessageHandler(clear_chat, filters.private & filters.command(["clearchat"])))
     bot.add_handler(MessageHandler(
         save,
-        filters.private & filters.text & ~filters.command(["start", "help", "cancel", "login", "logout", "broadcast"])
+        filters.private & filters.text & \~filters.command([
+            "start", "help", "cancel", "login", "logout", "broadcast",
+            "plans", "myplan", "setchat", "settopic", "clearchat"
+        ])
     ))
-    bot.add_handler(MessageHandler(
-        broadcast,
-        filters.command(["broadcast"]) & filters.user(ADMINS)
-    ))
+    bot.add_handler(MessageHandler(broadcast, filters.command(["broadcast"]) & filters.user(ADMINS)))
+
+    # Callback handlers
+    bot.add_handler(CallbackQueryHandler(cb_show_plans, filters.regex(r"^show_plans$")))
+    bot.add_handler(CallbackQueryHandler(cb_select_plan, filters.regex(r"^plan_(\d+)_(\d+)$")))
+    bot.add_handler(CallbackQueryHandler(cb_paid, filters.regex(r"^paid_(\d+)_(\d+)$")))
+    bot.add_handler(CallbackQueryHandler(cb_approve, filters.regex(r"^approve_(\d+)_(\d+)$")))
+    bot.add_handler(CallbackQueryHandler(cb_reject, filters.regex(r"^reject_(\d+)$")))
+    bot.add_handler(CallbackQueryHandler(cb_cancel_pay, filters.regex(r"^cancel_pay$")))
 
     bot.run()
