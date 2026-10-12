@@ -575,8 +575,13 @@ async def save(client: Client, message: Message):
                 return await message.reply(
               "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
                 )
-                    if ERROR_MESSAGE:
-                await client.send_else:
+                                if ERROR_MESSAGE:
+                await client.send_message(
+                    message.chat.id,
+                    "Error: Login session expired. Please /logout and /login again.",
+                    reply_to_message_id=message.id
+                )
+            return
             if BeastXUser is None:
                 await client.send_message(message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
                 return
