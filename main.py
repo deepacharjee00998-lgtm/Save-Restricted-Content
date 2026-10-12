@@ -512,7 +512,11 @@ def progress(current, total, message, type):
 # =========================
 # Main Save Handler (with access check)
 # =========================
-@Client.on_message(filters.text & filters.private & \~filters.command(["start", "help", "cancel", "login", "logout", "broadcast", "plans", "myplan", "setchat", "settopic", "clearchat"]))
+@client.on_message(
+    filters.text
+    & filters.private
+    & ~filters.command(["start", "help", "cancel", "login", "logout", "broadcast", "plans", "myplan", "letschat", "settopid", "clearchat"])
+)
 async def save(client: Client, message: Message):
     # Access Check
     access, reason = await has_access(message.from_user.id)
