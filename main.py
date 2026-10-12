@@ -571,19 +571,18 @@ async def save(client: Client, message: Message):
             try:
                 acc = Client("saverestricted", session_string=user_data, api_hash=api_hash, api_id=api_id)
                 await acc.connect()
-            except:
+                        except:
                 return await message.reply(
-              "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
-                )
-                                if ERROR_MESSAGE:
+                    "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
+            )
+                    
+            else:
+            if BeastXUser is None:
                 await client.send_message(
                     message.chat.id,
-                    "Error: Login session expired. Please /logout and /login again.",
+                    "**String Session is not Set**",
                     reply_to_message_id=message.id
-                                )
-            return
-            if BeastXUser is None:
-                await client.send_message(message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
+                )
                 return
             acc = BeastXUser
 
