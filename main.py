@@ -834,7 +834,8 @@ def get_message_type(msg):
 # Login / Logout
 # =========================
 SESSION_STRING_SIZE = 351
-PLAIN_TEXT = filters.text & \~filters.regex(r"^/")
+
+PLAIN_TEXT = filters.text & ~filters.regex(r"^/")
 LOGIN_INPUT = PLAIN_TEXT | filters.command(["cancel"])
 API_ID_INPUT = PLAIN_TEXT | filters.command(["skip", "cancel"])
 
